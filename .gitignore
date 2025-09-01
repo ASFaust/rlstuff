@@ -1,0 +1,12 @@
+#ignore mp4 files
+*.mp4
+#ignore pth files
+*.pth
+#python ignore
+__pycache__/
+*.pyc
+#ignore env files
+env/
+venv/
+#ignore pycharm files
+.idea/
