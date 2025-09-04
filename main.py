@@ -8,7 +8,7 @@ from agent import Embedder, TransitionModel, DistanceFunction, RewardModel
 from sklearn.metrics import roc_auc_score
 import numpy as np
 import torch.nn.functional as F
-env_id = "ALE/Breakout-v5"
+env_id = "ALE/Qbert-v5"
 env = make_atari_env(env_id, seed=42)()  # Create an environment instance
 embedding_dim = 128
 
@@ -45,10 +45,11 @@ ma_trans_loss = 0.0
 
 ma_dist_loss = 0.0
 ma_triangle_loss = 0.0
-ma_dist_pred = 0.0
+ma_dist_pred_min = 0.0
+ma_dist_pred_max = 0.0
 ma_direct_loss = 0.0
 ma_reward_loss = 0.0
-ma_reachability_loss = 0.0
+ma_diff_minmax = 0.0
 
 """
         return {
@@ -77,16 +78,19 @@ def mse_log_loss(pred, target):
     """
     return F.mse_loss(torch.log1p(pred), torch.log1p(target))
 
-n_epochs = 100
+def linear_loss(pred, target):
+    #min(linear, mse)
+    return torch.min(F.l1_loss(pred, target), F.mse_loss(pred, target))
+
+n_epochs = 200
 for i in range(n_epochs):
     dataloader = torch.utils.data.DataLoader(datamodule, batch_size=256, shuffle=True)
 
     eps = (1.0 - i/n_epochs) # goes from 1.0 to 0.0
     #make it exponentially decay
-    eps = eps * eps
+    #eps = eps * eps
     #make it go from 10 to 0.001
-    eps = eps * 10.0 + 0.001
-
+    eps = eps + 0.001
 
     for batch in dataloader:
         opt.zero_grad()
@@ -97,7 +101,6 @@ for i in range(n_epochs):
         a2 = batch["a2"].to("cuda", non_blocking=True)
         sn = batch["sn"].to("cuda", non_blocking=True)
         sm = batch["sm"].to("cuda", non_blocking=True)
-        sx = batch["sx"].to("cuda", non_blocking=True)
         d1 = batch["d1"].to("cuda", non_blocking=True).float()
         d2 = batch["d2"].to("cuda", non_blocking=True).float()
         r1 = batch["r1"].to("cuda", non_blocking=True).float()
@@ -106,7 +109,6 @@ for i in range(n_epochs):
         e3 = emb(s3)
         en = emb(sn)
         em = emb(sm)
-        ex = emb(sx)
 
         e2_pred = transition(e1, a1)
         e3_pred = transition(e2_pred, a2)
@@ -118,36 +120,45 @@ for i in range(n_epochs):
         reward_loss = mse_loss(r1_pred, r1)
         ma_reward_loss = reward_loss.item() * 0.05 + ma_reward_loss * 0.95
 
-        pd1, _ = dist(e1, en)
-        pd2, _ = dist(en, em)
-        pd_tot, p_tot_reachability = dist(e1, em)
-        pd_direct, p_direct_reachability = dist(e1, e2)
-        _, p_unreachable = dist(e1, ex)
+        pd1_min, pd1_max = dist(e1, en)
+        pd2_min, pd2_max = dist(en, em)
+        pd_tot_min, pd_tot_max = dist(e1, em)
+        pd_direct_min, pd_direct_max = dist(e1, e2)
 
-        loss_direct = mse_loss(pd_direct, torch.ones_like(pd_direct))
+        #the direct distance is at most 1 step
+        loss_direct_min = (pd_direct_min - 1.0).clamp(min=0.0).pow(2).mean()
+        #and at least 1 step for the max, right?
+        loss_direct_max = (1.0 - pd_direct_max).clamp(min=0.0).pow(2).mean()
+        loss_direct = loss_direct_min + loss_direct_max
         ma_direct_loss = loss_direct.item() * 0.05 + ma_direct_loss * 0.95
 
-        #triangle inequality: pd_tot <= pd1 + pd2
-        triangle_loss = (pd_tot - (pd1 + pd2)).clamp(min=0.0).pow(2).mean()
+        #triangle inequality: pd_tot_min <= pd1_min + pd2_min
+        triangle_loss_min = (pd_tot_min - (pd1_min + pd2_min)).clamp(min=0.0).mean()
+        #for max side: pd_tot_max >= pd1_max + pd2_max
+        triangle_loss_max = ((pd1_max + pd2_max) - pd_tot_max).clamp(min=0.0).mean()
+        triangle_loss = triangle_loss_min + triangle_loss_max
         ma_triangle_loss = triangle_loss.item() * 0.05 + ma_triangle_loss * 0.95
 
         with torch.no_grad():
-            target_tot = torch.min(pd_tot + eps, d1 + d2)
+            twos = torch.ones_like(d1)
+            hundred = 50 * twos
+            target_tot_min = torch.min(pd_tot_min + eps, torch.min((torch.max(pd1_min + pd2_min,twos) + d1 + d2) * 0.5, d1 + d2))
+            target_tot_max = torch.max(pd_tot_max - eps, torch.max((torch.min(pd1_max + pd2_max,hundred) + d1 + d2) * 0.5, d1 + d2))
 
-        loss_dist = mse_loss(pd_tot, target_tot)
-
-        #we now use the reachability logits
-        # positive samples are (e1, em) with label 1
-        # negative samples are (e1, ex) with label 0
-        reachability_loss = bce_loss(p_tot_reachability, torch.ones_like(p_tot_reachability)) + \
-                            bce_loss(p_unreachable, torch.zeros_like(p_unreachable))
-
-        ma_reachability_loss = reachability_loss.item() * 0.05 + ma_reachability_loss * 0.95
+        loss_dist = linear_loss(pd_tot_min, target_tot_min) + linear_loss(pd_tot_max, target_tot_max)
 
         ma_dist_loss = loss_dist.item() * 0.05 + ma_dist_loss * 0.95
-        ma_dist_pred = pd_tot.max().item() * 0.05 + ma_dist_pred * 0.95
+        ma_dist_pred_min = pd_tot_min.mean().item() * 0.05 + ma_dist_pred_min * 0.95
+        ma_dist_pred_max = pd_tot_max.mean().item() * 0.05 + ma_dist_pred_max * 0.95
 
-        loss = loss_dist + triangle_loss + loss_direct + transition_loss * 0.01 + reward_loss * 10.0 + reachability_loss
+        diff_minmax = (pd_tot_max - pd_tot_min).detach().mean().item()
+
+        ma_diff_minmax = diff_minmax * 0.05 + ma_diff_minmax * 0.95
+
+        #this loss forces the min to be smaller than the max
+        loss_diff_minmax = (pd_tot_min - pd_tot_max).clamp(min=0.0).pow(2).mean()
+
+        loss = loss_dist  + loss_direct + transition_loss * 0.01 + reward_loss + triangle_loss + loss_diff_minmax
 
         loss.backward()
         opt.step()
@@ -156,14 +167,14 @@ for i in range(n_epochs):
         ma_emb_std = e1.std().mean().item() * 0.05 + ma_emb_std * 0.95
 
         print(
-            f"Epoch {i:03d}, Losses: "
-            f"Distance: {ma_dist_loss:0.4f}, "
-            f"Triangle: {ma_triangle_loss:0.4f}, "
-            f"Direct: {ma_direct_loss:0.4f}, "
-            f"Transition: {ma_trans_loss:0.4f}, "
-            f"Reward: {ma_reward_loss:0.4f}, "
-            f"Reachability: {ma_reachability_loss:0.4f} | "
-            f" Dist Pred: {ma_dist_pred:0.2f}    \r",
+            f"Epoch {i:03d} "
+            f"Distance: {ma_dist_loss:0.4f} "
+            f"Triangle: {ma_triangle_loss:0.4f} "
+            f"Direct: {ma_direct_loss:0.4f} "
+            f"Transition: {ma_trans_loss:0.4f} "
+            f"Reward: {ma_reward_loss:0.4f} "
+            f"DiffMinMax: {ma_diff_minmax:0.4f} "
+            f"Dist Pred: {ma_dist_pred_min:0.2f}-{ma_dist_pred_max:0.2f}\r",
             end="",
             flush=True
         )

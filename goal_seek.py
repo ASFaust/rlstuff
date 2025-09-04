@@ -153,7 +153,7 @@ def render_hud_band(
                 h_top,
                 series=dist_history,
                 label="dist",
-                label_fmt=lambda vmin, vmax: f"dist [{vmin:.2f}, {vmax:.2f}]",
+                label_fmt=lambda vmin, vmax: f"min dist [{vmin:.2f}, {vmax:.2f}]",
                 y_range=None,            # autoscale
                 bg_col=(70, 70, 70),
                 frame_col=(90, 90, 90),
@@ -168,8 +168,8 @@ def render_hud_band(
                 h_bot,
                 series=reach_history,
                 label="reach",
-                label_fmt=lambda vmin, vmax: f"reach [{max(0,vmin):.2f}, {min(1,vmax):.2f}]",
-                y_range=(0.0, 1.0),      # fixed scale
+                label_fmt=lambda vmin, vmax: f"max dist [{vmin:.2f}, {vmax:.2f}]",
+                y_range=None,
                 bg_col=(70, 70, 70),
                 frame_col=(90, 90, 90),
                 line_col=(210, 210, 210),
@@ -441,76 +441,67 @@ def main():
 
     for t in range(args.max_steps):
         with torch.no_grad():
-            curr = obs_to_tensor(obs, device)
-            e_curr = emb(curr)  # [1, D]
+            e_curr = emb(obs_to_tensor(obs, device))  # [1,D]
 
-            # 1) First-step predictions for all a1
-            A1 = torch.arange(n_actions, device=device, dtype=torch.long)
-            e_curr_rep = e_curr.repeat(n_actions, 1)  # [A, D]
-            e_after_a1 = trans(e_curr_rep, A1)  # [A, D]
+            # first step expansions
+            A1 = torch.arange(n_actions, device=device)
+            e_after_a1 = trans(e_curr.repeat(n_actions, 1), A1)  # [A,D]
 
-            # 2) Second-step predictions for all (a1, a2) pairs
-            A2 = torch.arange(n_actions, device=device, dtype=torch.long)
-            e_after_a1_rep = e_after_a1.unsqueeze(1).repeat(1, n_actions, 1)  # [A, A, D]
-            e_after_a1a2_in = e_after_a1_rep.reshape(n_actions * n_actions, -1)  # [A*A, D]
-            A2_tiled = A2.repeat(n_actions)  # [A*A]
+            # second step expansions
+            A2 = torch.arange(n_actions, device=device)
+            e_after_a1a2_in = e_after_a1.unsqueeze(1).repeat(1, n_actions, 1).reshape(n_actions * n_actions, -1)
+            A2_tiled = A2.repeat(n_actions)
+            e_after_a1a2 = trans(e_after_a1a2_in, A2_tiled)  # [A*A,D]
 
-            e_after_a1a2 = trans(e_after_a1a2_in, A2_tiled)  # [A*A, D]
+            # distance intervals to goal
+            e_goal_rep = e_goal.expand_as(e_after_a1a2)
+            d_min_pairs, d_max_pairs = dist_fn(e_after_a1a2, e_goal_rep)  # each [A*A]
+            d_min_pairs = d_min_pairs.view(n_actions, n_actions)
+            d_max_pairs = d_max_pairs.view(n_actions, n_actions)
 
-            # 3) Distances + reachability for all pairs
-            e_goal_rep_pairs = e_goal.expand(e_after_a1a2.size(0), -1)  # [A*A, D]
-            d_pairs, reach_logits = dist_fn(e_after_a1a2, e_goal_rep_pairs)  # each [A*A, 1]
-            d_pairs = d_pairs.squeeze(-1)  # [A*A]
-            reach_probs = torch.sigmoid(reach_logits.squeeze(-1))  # [A*A]
-
-            # Reshape back to [A1, A2]
-            d_after_a1a2 = d_pairs.view(n_actions, n_actions)  # [A, A] raw distances
-            reach_after_a1a2 = reach_probs.view(n_actions, n_actions)  # [A, A]
-
-            # --- New: threshold by a global reachability baseline (no division) ---
-            baseline_reach = reach_after_a1a2.max()  # scalar
-            reach_thresh = 0.9 * baseline_reach
-
-            # Best achievable distance after two steps if we start with a1,
-            # but only over (a1,a2) pairs whose reachability >= 90% of baseline.
+            # --- filter + select ---
+            horizon_thresh = 100  # e.g. 2 steps, or longer horizon
             d_two_step_best = torch.empty(n_actions, device=device)
             best_a2_per_a1 = torch.empty(n_actions, dtype=torch.long, device=device)
 
             for a1 in range(n_actions):
-                row_reach = reach_after_a1a2[a1]  # [A]
-                row_dist = d_after_a1a2[a1]  # [A]
-                mask = row_reach >= reach_thresh  # [A] bool
+                row_min, row_max = d_min_pairs[a1], d_max_pairs[a1]
 
+                # only keep (a1,a2) where goal is still within reach horizon
+                mask = row_max >= horizon_thresh
                 if mask.any():
-                    # Restrict to sufficiently reachable a2
-                    filtered_dist = row_dist[mask]
-                    min_idx_local = torch.argmin(filtered_dist)
-                    d_two_step_best[a1] = filtered_dist[min_idx_local]
-                    # Map back to original a2 index
+                    valid_min = row_min[mask]
+                    min_idx_local = torch.argmin(valid_min)
+                    d_two_step_best[a1] = valid_min[min_idx_local]
                     best_a2_per_a1[a1] = mask.nonzero(as_tuple=False).view(-1)[min_idx_local]
                 else:
-                    # Fallback: if nothing passes the threshold, use the best raw distance in this row
-                    best_a2_per_a1[a1] = torch.argmin(row_dist)
-                    d_two_step_best[a1] = row_dist[best_a2_per_a1[a1]]
+                    # fallback: pick by smallest d_min
+                    best_a2_per_a1[a1] = torch.argmin(row_min)
+                    d_two_step_best[a1] = row_min[best_a2_per_a1[a1]]
 
-            # 5) Pick a1 with 10% near-optimal tie-break
-            d_min = float(d_two_step_best.min().item())
-            near_min = (d_two_step_best <= d_min * 1.01).nonzero(as_tuple=False).view(-1)
+            # choose a1 with near-optimal d_min
+            d_min_global = d_two_step_best.min().item()
+            near_min = (d_two_step_best <= d_min_global * 1.01).nonzero(as_tuple=False).view(-1)
             a1_star = int(near_min[torch.randint(len(near_min), (1,)).item()])
-
-            # For logging: the corresponding best a2 given chosen a1
-            a2_star = int(best_a2_per_a1[a1_star].item())
-            pred_min = float(d_two_step_best[a1_star].item())  # two-step best under reachability threshold
+            a2_star = int(best_a2_per_a1[a1_star])
 
             # Current raw distance to goal (for HUD/plotting)
-            d_curr_val, reachability_logit_curr_val = dist_fn(e_curr, e_goal)
-            d_curr_val = float(d_curr_val.item())
-            reachability_curr_val = float(torch.sigmoid(reachability_logit_curr_val).item())
-            reachability_hist.append(reachability_curr_val)
-            dist_hist.append(d_curr_val)
+            #d_curr_val, reachability_logit_curr_val = dist_fn(e_curr, e_goal)
+            #d_curr_val = float(d_curr_val.item())
+            #reachability_curr_val = float(torch.sigmoid(reachability_logit_curr_val).item())
+            #reachability_hist.append(reachability_curr_val)
+            #dist_hist.append(d_curr_val)
+
+            d_curr_min, d_curr_max = dist_fn(e_curr, e_goal)
+            d_curr_min = float(d_curr_min.item())
+            d_curr_max = float(d_curr_max.item())
+            dist_hist.append(d_curr_min)
+            reachability_hist.append(d_curr_max)
+
+            pred_min = float(d_two_step_best[a1_star].item())
+
 
             # Optional logging
-            avg_reach_prob = float(reach_after_a1a2[a1_star].mean().item())
 
         # Compose and write video frame BEFORE stepping (so frame reflects 'curr' state)
 
@@ -518,7 +509,7 @@ def main():
         if writer is not None:
             hud_lines = [
                 f"t={t:04d}   a*={a1_star:2d}",
-                f"dist(curr,goal)={d_curr_val:.3f}",
+                f"dist(curr,goal)={d_curr_min:.3f}",
                 f"pred_dist(next,goal)={pred_min:.3f}",
                 f"total_reward={total_reward:.2f}",
             ]
@@ -532,16 +523,16 @@ def main():
             )
             writer.write(frame)
 
-        if d_curr_val <= args.threshold:
-            print(f"[t={t}] Reached goal proximity: dist={d_curr_val:.3f} <= {args.threshold:.3f}")
-            reached = True
-            break
+        #if d_curr_val <= args.threshold:
+        #    print(f"[t={t}] Reached goal proximity: dist={d_curr_val:.3f} <= {args.threshold:.3f}")
+        #    reached = True
+        #    break
 
         # Step env using the chosen action
         obs, r, terminated, truncated, info = env.step(a1_star)
         total_reward += float(r)
 
-        print(f"[t={t}] a*={a1_star:2d} | dist(curr,goal)={d_curr_val:.3f} "
+        print(f"[t={t}] a*={a1_star:2d} | dist(curr,goal)={d_curr_min:.3f} "
               f"| pred_dist(next,goal)={pred_min:.3f} | reward={r}")
 
         if terminated or truncated:

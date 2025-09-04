@@ -75,15 +75,16 @@ class DistanceFunction(nn.Module):
             nn.SiLU(),
             nn.Linear(512, 256),
             nn.SiLU(),
-            nn.Linear(256, 2) #distance + wether it is reachable
+            nn.Linear(256, 2) # predict min and max distance
         )
         self.softplus = nn.Softplus()
 
     def forward(self, emb1, emb2):
         x = torch.cat([emb1, emb2], dim=1)
-        distance, reachable_logits = self.fc(x).squeeze(-1).split(1, dim=-1)
-        distance = self.softplus(distance) + 1.0
-        return distance.squeeze(-1), reachable_logits.squeeze(-1)
+        min_dist, max_dist = self.softplus(self.fc(x).squeeze(-1)).split(1, dim=-1)
+        #min_dist = min_dist + 1 # ensure min > 0: we measure number of steps needed to reach, so min is at least 1
+        #max_dist = max_dist + min_dist  # ensure max >= min
+        return min_dist.squeeze(-1), max_dist.squeeze(-1)
 
 class RewardModel(nn.Module):
     """
@@ -104,3 +105,4 @@ class RewardModel(nn.Module):
     def forward(self, emb):
         reward = self.fc(emb).squeeze(-1)
         return reward
+
