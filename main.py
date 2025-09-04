@@ -3,12 +3,12 @@ from simpleRL import run_to_completion, make_atari_env
 
 import torch
 import torch.nn as nn
-from dataset import ZippedDataset, ReachabilityDataset, RewardDataset
-from agent import Embedder, Evaluator, TransitionModel, SimpleTransitionModel, RewardPredictor
+from dataset import SequenceDataset
+from agent import Embedder, TransitionModel, DistanceFunction, RewardModel
 from sklearn.metrics import roc_auc_score
 import numpy as np
 import torch.nn.functional as F
-env_id = "ALE/Pong-v5"
+env_id = "ALE/Breakout-v5"
 env = make_atari_env(env_id, seed=42)()  # Create an environment instance
 embedding_dim = 128
 
@@ -19,104 +19,154 @@ def random_policy(obs_batch):
     B = obs_batch.shape[0]
     return torch.randint(0, env.action_space.n, (B,), device=obs_batch.device)
 
-S, A, R, TR = run_to_completion(env_fn=lambda: env, policy=random_policy, n_runs=20, device="cpu")
+S, A, R, TR = run_to_completion(env_fn=lambda: env, policy=random_policy, n_runs=40, device="cpu")
 
 def sum_rewards(rewards):
     return sum(sum(ep_rewards) for ep_rewards in rewards)
 
 print("Total rewards over random policy:", sum_rewards(R))
 
-reward_datamodule = RewardDataset(S, R, device="cuda")
-reachability_datamodule = ReachabilityDataset(S, A, device="cuda")
-datamodule = ZippedDataset(reward_datamodule, reachability_datamodule)
+datamodule = SequenceDataset(S, A, R, device="cuda")
 
 print("Dataset size (number of (state, action) pairs):", len(datamodule))
 
 emb = Embedder(env.observation_space.shape,embedding_dim).to("cuda")
-eval = Evaluator(embedding_dim).to("cuda")
-transition_model = TransitionModel(env.action_space.n, embedding_dim).to("cuda")
-simple_tm = SimpleTransitionModel(embedding_dim).to("cuda")
-reward_predictor = RewardPredictor(embedding_dim).to("cuda")
+dist = DistanceFunction(embedding_dim).to("cuda")
+transition = TransitionModel(env.action_space.n, embedding_dim).to("cuda")
+reward_model = RewardModel(embedding_dim).to("cuda")
 
-all_params = list(emb.parameters()) + list(eval.parameters()) + list(transition_model.parameters()) + list(simple_tm.parameters()) + list(reward_predictor.parameters())
+all_params = list(emb.parameters()) + list(dist.parameters()) + list(transition.parameters()) + list(reward_model.parameters())
 opt = torch.optim.Adam(all_params, lr=1e-4)
 
-ma_emb_loss = 0.0
-ma_trans_loss = 0.0
-ma_trans_simple_loss = 0.0
 ma_emb_mean = 0.0
-ma_emb_var = 0.0
+ma_emb_std = 0.0
+
+ma_trans_loss = 0.0
+
+ma_dist_loss = 0.0
+ma_triangle_loss = 0.0
+ma_dist_pred = 0.0
+ma_direct_loss = 0.0
 ma_reward_loss = 0.0
+ma_reachability_loss = 0.0
+
+"""
+        return {
+            "s1": s1,
+            "s2": s2,
+            "sn": sn,
+            "sm": sm,
+            "a1": a1,
+            "d1" : d1,
+            "d2" : d2,
+            "r1" : r1,
+        }
+
+"""
 
 mse_loss = nn.MSELoss()
+ce_loss = nn.CrossEntropyLoss()
 bce_loss = nn.BCEWithLogitsLoss()
 
-for i in range(100):
-    dataloader = torch.utils.data.DataLoader(datamodule, batch_size=512, shuffle=True)
+def mse_log_loss(pred, target):
+    """
 
-    all_labels = []
-    all_probs = []
-    for reward_batch,reachability_batch in dataloader:
+    :param pred:
+    :param target:
+    :return:
+    """
+    return F.mse_loss(torch.log1p(pred), torch.log1p(target))
+
+n_epochs = 100
+for i in range(n_epochs):
+    dataloader = torch.utils.data.DataLoader(datamodule, batch_size=256, shuffle=True)
+
+    eps = (1.0 - i/n_epochs) # goes from 1.0 to 0.0
+    #make it exponentially decay
+    eps = eps * eps
+    #make it go from 10 to 0.001
+    eps = eps * 10.0 + 0.001
+
+
+    for batch in dataloader:
         opt.zero_grad()
+        s1 = batch["s1"].to("cuda", non_blocking=True)
+        s2 = batch["s2"].to("cuda", non_blocking=True)
+        s3 = batch["s3"].to("cuda", non_blocking=True)
+        a1 = batch["a1"].to("cuda", non_blocking=True)
+        a2 = batch["a2"].to("cuda", non_blocking=True)
+        sn = batch["sn"].to("cuda", non_blocking=True)
+        sm = batch["sm"].to("cuda", non_blocking=True)
+        sx = batch["sx"].to("cuda", non_blocking=True)
+        d1 = batch["d1"].to("cuda", non_blocking=True).float()
+        d2 = batch["d2"].to("cuda", non_blocking=True).float()
+        r1 = batch["r1"].to("cuda", non_blocking=True).float()
+        e1 = emb(s1)
+        e2 = emb(s2)
+        e3 = emb(s3)
+        en = emb(sn)
+        em = emb(sm)
+        ex = emb(sx)
 
-        reward_state = reward_batch["state"].to("cuda")
-        rewards = reward_batch["reward"].to("cuda")
-        reward_emb = emb(reward_state)
-        reward_pred = reward_predictor(reward_emb).squeeze(-1)
-        reward_loss = mse_loss(reward_pred, rewards)
+        e2_pred = transition(e1, a1)
+        e3_pred = transition(e2_pred, a2)
+        transition_loss = mse_loss(e2_pred, e2) + mse_loss(e3_pred, e3)
 
-        reach_states = reachability_batch["state"].to("cuda")
-        next_states = reachability_batch["next_state"].to("cuda")
-        actions = reachability_batch["action"].to("cuda")
+        ma_trans_loss = transition_loss.item() * 0.05 + ma_trans_loss * 0.95
 
-        comp_state = reachability_batch["compare_state"].to("cuda")
-        labels = reachability_batch["label"].to("cuda")
+        r1_pred = reward_model(e1).squeeze(-1)
+        reward_loss = mse_loss(r1_pred, r1)
+        ma_reward_loss = reward_loss.item() * 0.05 + ma_reward_loss * 0.95
 
-        emb_out = emb(reach_states)
+        pd1, _ = dist(e1, en)
+        pd2, _ = dist(en, em)
+        pd_tot, p_tot_reachability = dist(e1, em)
+        pd_direct, p_direct_reachability = dist(e1, e2)
+        _, p_unreachable = dist(e1, ex)
 
-        emb_next = emb(next_states)
-        emb_comp = emb(comp_state)
+        loss_direct = mse_loss(pd_direct, torch.ones_like(pd_direct))
+        ma_direct_loss = loss_direct.item() * 0.05 + ma_direct_loss * 0.95
 
-        eval_out = eval(emb_comp, emb_out)
-        emb_loss = bce_loss(eval_out, labels)
+        #triangle inequality: pd_tot <= pd1 + pd2
+        triangle_loss = (pd_tot - (pd1 + pd2)).clamp(min=0.0).pow(2).mean()
+        ma_triangle_loss = triangle_loss.item() * 0.05 + ma_triangle_loss * 0.95
 
-        emb_trans = transition_model(emb_out, actions)
+        with torch.no_grad():
+            target_tot = torch.min(pd_tot + eps, d1 + d2)
 
-        trans_loss = mse_loss(emb_trans, emb_next)
-        trans_simple_loss = mse_loss(simple_tm(emb_out.detach()), emb_next.detach())
+        loss_dist = mse_loss(pd_tot, target_tot)
 
-        loss = emb_loss + trans_loss + trans_simple_loss + reward_loss
+        #we now use the reachability logits
+        # positive samples are (e1, em) with label 1
+        # negative samples are (e1, ex) with label 0
+        reachability_loss = bce_loss(p_tot_reachability, torch.ones_like(p_tot_reachability)) + \
+                            bce_loss(p_unreachable, torch.zeros_like(p_unreachable))
+
+        ma_reachability_loss = reachability_loss.item() * 0.05 + ma_reachability_loss * 0.95
+
+        ma_dist_loss = loss_dist.item() * 0.05 + ma_dist_loss * 0.95
+        ma_dist_pred = pd_tot.max().item() * 0.05 + ma_dist_pred * 0.95
+
+        loss = loss_dist + triangle_loss + loss_direct + transition_loss * 0.01 + reward_loss * 10.0 + reachability_loss
+
         loss.backward()
         opt.step()
 
-        # moving averages
-        ma_emb_loss = 0.99 * ma_emb_loss + 0.01 * emb_loss.item() if ma_emb_loss > 0 else emb_loss.item()
-        ma_trans_loss = 0.99 * ma_trans_loss + 0.01 * trans_loss.item() if ma_trans_loss > 0 else trans_loss.item()
-        ma_trans_simple_loss = 0.99 * ma_trans_simple_loss + 0.01 * trans_simple_loss.item() if ma_trans_simple_loss > 0 else trans_simple_loss.item()
-        ma_emb_mean = 0.99 * ma_emb_mean + 0.01 * emb_out.mean().item() if ma_emb_mean > 0 else emb_out.mean().item()
-        ma_emb_var = 0.99 * ma_emb_var + 0.01 * emb_out.var().item() if ma_emb_var > 0 else emb_out.var().item()
-        ma_reward_loss = 0.99 * ma_reward_loss + 0.01 * reward_loss.item() if ma_reward_loss > 0 else reward_loss.item()
+        ma_emb_mean = e1.mean().item() * 0.05 + ma_emb_mean * 0.95
+        ma_emb_std = e1.std().mean().item() * 0.05 + ma_emb_std * 0.95
 
-        # store for AUC
-        probs = torch.sigmoid(eval_out).detach().cpu().numpy()
-        all_probs.append(probs)
-        all_labels.append(labels.detach().cpu().numpy())
-
-    # concatenate and compute AUC after epoch
-    all_probs = np.concatenate(all_probs)
-    all_labels = np.concatenate(all_labels)
-    auc = roc_auc_score(all_labels, all_probs)
-
-    print(
-        f"Epoch {i:03d}: "
-        f"emb_loss={ma_emb_loss:.4f}, "
-        f"trans_loss={ma_trans_loss:.4f}, "
-        f"trans_simple_loss={ma_trans_simple_loss:.4f}, "
-        f"reward_loss={ma_reward_loss:.4f}, "
-        f"emb_mean={ma_emb_mean:.4f}, "
-        f"emb_var={ma_emb_var:.4f}, "
-        f"AUC={auc:.4f}"
-    )
+        print(
+            f"Epoch {i:03d}, Losses: "
+            f"Distance: {ma_dist_loss:0.4f}, "
+            f"Triangle: {ma_triangle_loss:0.4f}, "
+            f"Direct: {ma_direct_loss:0.4f}, "
+            f"Transition: {ma_trans_loss:0.4f}, "
+            f"Reward: {ma_reward_loss:0.4f}, "
+            f"Reachability: {ma_reachability_loss:0.4f} | "
+            f" Dist Pred: {ma_dist_pred:0.2f}    \r",
+            end="",
+            flush=True
+        )
 
 #save the model
 torch.save({
@@ -127,8 +177,119 @@ torch.save({
         'obs_shape': env.observation_space.shape,
     },
     'embedder_state_dict': emb.state_dict(),
-    'evaluator_state_dict': eval.state_dict(),
-    'transition_model_state_dict': transition_model.state_dict(),
-    'simple_tm_state_dict': simple_tm.state_dict(),
-    'reward_predictor_state_dict': reward_predictor.state_dict(),
+    'distance_state_dict': dist.state_dict(),
+    'transition_model_state_dict': transition.state_dict(),
 }, "model.pth")
+
+import torch
+import matplotlib.pyplot as plt
+
+# --- collect embeddings as before ---
+emb.eval()
+infer_loader = torch.utils.data.DataLoader(datamodule, batch_size=512, shuffle=True)
+
+emb_list = []
+with torch.no_grad():
+    for batch in infer_loader:
+        s1 = batch["s1"].to("cuda", non_blocking=True)
+        e1 = emb(s1)
+        emb_list.append(e1.detach().cpu())
+E = torch.cat(emb_list, dim=0)  # [N, D]
+
+# --- center and compute covariance ---
+E_centered = E - E.mean(dim=0, keepdim=True)
+N = E_centered.shape[0]
+C = (E_centered.T @ E_centered) / (N - 1)
+
+# --- eigen decomposition ---
+eigvals, _ = torch.linalg.eigh(C)  # ascending
+eigvals = eigvals.flip(0)          # descending
+
+# --- plot ---
+plt.figure(figsize=(8,5))
+plt.plot(eigvals.numpy(), marker="o", linestyle="-")
+plt.title("Embedding covariance eigenvalue spectrum")
+plt.xlabel("Principal component index")
+plt.ylabel("Eigenvalue (variance explained)")
+plt.grid(True, which="both", ls="--", lw=0.5)
+plt.tight_layout()
+plt.savefig("eigenvalue_spectrum.png", dpi=150)
+#clean plt - dont show the plot
+plt.close()
+
+# --- visualize random (s1, sm) pairs with actual vs. predicted distances ---
+import math
+
+def _imshow_tensor(ax, t):
+    """
+    Show an image tensor t on a given matplotlib axis.
+    Supports HxWxC, CxHxW, HxW, and handles 1- or 3-channel visuals.
+    """
+    x = t.detach().cpu()
+    if x.dim() == 3:
+        # Either CxHxW or HxWxC
+        if x.shape[0] in (1, 3):  # CxHxW
+            if x.shape[0] == 1:
+                ax.imshow(x[0], cmap="gray")
+            else:
+                ax.imshow(x.permute(1, 2, 0))
+        else:  # HxWxC
+            if x.shape[-1] == 1:
+                ax.imshow(x[..., 0], cmap="gray")
+            else:
+                ax.imshow(x)
+    elif x.dim() == 2:  # HxW
+        ax.imshow(x, cmap="gray")
+    else:
+        raise ValueError(f"Unsupported image shape: {tuple(x.shape)}")
+    ax.axis("off")
+
+def plot_sample_pairs_with_distances(emb, dist, datamodule, num_samples=6, batch_size=64):
+    """
+    Draw 'num_samples' random pairs (s1, sm) from the dataloader and annotate:
+      - actual distance = d1 + d2
+      - predicted distance = dist(emb(s1), emb(sm))
+    """
+    emb.eval()
+    dist.eval()
+
+    loader = torch.utils.data.DataLoader(datamodule, batch_size=batch_size, shuffle=True, drop_last=False)
+    with torch.no_grad():
+        batch = next(iter(loader))
+
+        s1 = batch["s1"].to("cuda", non_blocking=True)
+        sm = batch["sm"].to("cuda", non_blocking=True)
+        d1 = batch["d1"].to("cuda", non_blocking=True).float()
+        d2 = batch["d2"].to("cuda", non_blocking=True).float()
+
+        e1 = emb(s1)
+        em = emb(sm)
+        pd_tot_l,pd_tot_u = dist(e1, em)  # predicted distance
+        actual = (d1 + d2)     # actual distance proxy from dataset
+
+        # choose a subset of indices to display
+        n = min(num_samples, s1.shape[0])
+        idx = torch.randperm(s1.shape[0], device=s1.device)[:n].cpu().tolist()
+
+        fig, axes = plt.subplots(nrows=n, ncols=2, figsize=(8, 3 * n))
+        if n == 1:
+            axes = [axes]  # normalize shape to list of [left,right]
+
+        for row, i in enumerate(idx):
+            ax_left, ax_right = axes[row]
+
+            _imshow_tensor(ax_left, s1[i][0])
+            _imshow_tensor(ax_right, sm[i][0])
+
+            a = float(actual[i].item())
+            p = float(pd_tot_l[i].item())
+            ax_left.set_title(f"Pair {row+1} — actual: {a:.2f}, predicted: {p:.2f}", fontsize=10)
+            ax_right.set_title("target state (sm)", fontsize=10)
+            ax_left.set_xlabel("source state (s1)")
+
+        plt.tight_layout()
+        plt.savefig("sample_state_pairs_with_distances.png", dpi=150)
+        plt.close(fig)
+
+# Call after the eigenvalue spectrum plot:
+plot_sample_pairs_with_distances(emb, dist, datamodule, num_samples=6, batch_size=64)

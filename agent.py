@@ -27,32 +27,14 @@ class Embedder(nn.Module):
             nn.Linear(512, 256),
             nn.SiLU(),
             nn.Linear(256, embedding_dim), # output an embedding vector
-            nn.BatchNorm1d(embedding_dim, affine=False)
+            nn.Tanh(), # keep embeddings bounded (-1, 1
         )
 
     def forward(self, state):
         """Run input through conv+fc and return embedding."""
         x = (state.float() / 255.0).to(next(self.parameters()).device)
         x = self.conv(x).view(x.size(0), -1)
-        embedding = self.emb_head(x)
-        #normalize to unit sphere
-        return embedding
-
-class Evaluator(nn.Module):
-    def __init__(self, embedding_dim):
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(embedding_dim * 2, 512),  # include embedding
-            nn.SiLU(),
-            nn.Linear(512, 256),
-            nn.SiLU(),
-            nn.Linear(256, 1) # output probability logit
-        )
-
-    def forward(self, state1, state2):
-        x = torch.cat([state1, state2], dim=1)
-        logits = self.fc(x).squeeze(-1)  # shape [B]
-        return logits
+        return self.emb_head(x)
 
 class TransitionModel(nn.Module):
     """
@@ -68,51 +50,57 @@ class TransitionModel(nn.Module):
             nn.SiLU(),
             nn.Linear(512, 256),
             nn.SiLU(),
-            nn.Linear(256, embedding_dim), # output next embedding
-            nn.BatchNorm1d(embedding_dim, affine=False)
+            nn.Linear(256, embedding_dim),
+            nn.Tanh()
         )
+
 
     def forward(self, emb, action):
         action = action.squeeze(-1)
         action_onehot = F.one_hot(action, num_classes=self.n_actions).float()
         x = torch.cat([emb, action_onehot], dim=1)
-        next_emb = self.fc(x)
-        #normalize to unit sphere
-        return next_emb
+        return self.fc(x)
 
 
-class SimpleTransitionModel(nn.Module):
+class DistanceFunction(nn.Module):
     """
-    Given just an embedding, predict the next embedding
+    Given two embeddings, predict a scalar distance
     """
     def __init__(self, embedding_dim):
         super().__init__()
         self.embedding_dim = embedding_dim
 
         self.fc = nn.Sequential(
-            nn.Linear(embedding_dim, 512),
+            nn.Linear(2 * embedding_dim, 512),
             nn.SiLU(),
             nn.Linear(512, 256),
             nn.SiLU(),
-            nn.Linear(256, embedding_dim),
-            nn.BatchNorm1d(embedding_dim, affine=False)  # enforce mean=0, var=1
+            nn.Linear(256, 2) #distance + wether it is reachable
         )
+        self.softplus = nn.Softplus()
 
-    def forward(self, emb):
-        next_emb = self.fc(emb)
-        return next_emb
+    def forward(self, emb1, emb2):
+        x = torch.cat([emb1, emb2], dim=1)
+        distance, reachable_logits = self.fc(x).squeeze(-1).split(1, dim=-1)
+        distance = self.softplus(distance) + 1.0
+        return distance.squeeze(-1), reachable_logits.squeeze(-1)
 
-class RewardPredictor(nn.Module):
+class RewardModel(nn.Module):
+    """
+    Given an embedding, predict the reward
+    """
     def __init__(self, embedding_dim):
         super().__init__()
+        self.embedding_dim = embedding_dim
+
         self.fc = nn.Sequential(
-            nn.Linear(embedding_dim, 512),
+            nn.Linear(embedding_dim, 256),
             nn.SiLU(),
-            nn.Linear(512, 256),
+            nn.Linear(256, 128),
             nn.SiLU(),
-            nn.Linear(256, 1) # output reward prediction
+            nn.Linear(128, 1)
         )
 
     def forward(self, emb):
-        reward = self.fc(emb).squeeze(-1)  # shape [B]
+        reward = self.fc(emb).squeeze(-1)
         return reward
