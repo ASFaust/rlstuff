@@ -8,7 +8,7 @@ from agent import Embedder, TransitionModel, DistanceFunction, RewardModel
 from sklearn.metrics import roc_auc_score
 import numpy as np
 import torch.nn.functional as F
-env_id = "ALE/Qbert-v5"
+env_id = "ALE/MontezumaRevenge-v5"
 env = make_atari_env(env_id, seed=42)()  # Create an environment instance
 embedding_dim = 128
 
@@ -142,8 +142,8 @@ for i in range(n_epochs):
         with torch.no_grad():
             twos = torch.ones_like(d1)
             hundred = 50 * twos
-            target_tot_min = torch.min(pd_tot_min + eps, torch.min((pd1_min + pd2_min + d1 + d2) * 0.5, d1 + d2))
-            target_tot_max = torch.max(pd_tot_max - eps, torch.max((pd1_max + pd2_max+ d1 + d2) * 0.5, d1 + d2))
+            target_tot_min = torch.min(pd_tot_min + eps, torch.min((pd1_min + pd2_min) * 0.9 + (d1 + d2) * 0.1, d1 + d2))
+            target_tot_max = torch.max(pd_tot_max - eps, torch.max((pd1_max + pd2_max) * 0.9 + (d1 + d2) * 0.1, d1 + d2))
 
         loss_dist = linear_loss(pd_tot_min, target_tot_min) + linear_loss(pd_tot_max, target_tot_max)
 
