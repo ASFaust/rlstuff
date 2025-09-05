@@ -142,8 +142,8 @@ for i in range(n_epochs):
         with torch.no_grad():
             twos = torch.ones_like(d1)
             hundred = 50 * twos
-            target_tot_min = torch.min(pd_tot_min + eps, torch.min((torch.max(pd1_min + pd2_min,twos) + d1 + d2) * 0.5, d1 + d2))
-            target_tot_max = torch.max(pd_tot_max - eps, torch.max((torch.min(pd1_max + pd2_max,hundred) + d1 + d2) * 0.5, d1 + d2))
+            target_tot_min = torch.min(pd_tot_min + eps, torch.min((pd1_min + pd2_min + d1 + d2) * 0.5, d1 + d2))
+            target_tot_max = torch.max(pd_tot_max - eps, torch.max((pd1_max + pd2_max+ d1 + d2) * 0.5, d1 + d2))
 
         loss_dist = linear_loss(pd_tot_min, target_tot_min) + linear_loss(pd_tot_max, target_tot_max)
 
