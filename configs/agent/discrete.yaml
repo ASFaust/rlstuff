@@ -14,7 +14,7 @@ optimizer: adam
 subtract_min: true 
 alpha_init: 0.1
 learn_alpha: true
-rhs_grad_scale: 0.5 #0.0 = standard bellman, 1.0 = 2-sided bellman. 0.0 can overestimate value, 1.0 can prevent policy improvement. 
+rhs_grad_scale: 0.0 #0.0 = standard bellman, 1.0 = 2-sided bellman. 0.0 can overestimate value, 1.0 can prevent policy improvement. 
 #a bit of rhs_grad_scale can prevent overestimation while still allowing policy improvement.
 positivity_transform: exp #transform to ensure regret estimates are positive, can be "softplus", "exp", "relu", "square", or "abs"
 
