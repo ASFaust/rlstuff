@@ -62,44 +62,11 @@ class ReplayBuffer:
     def update_errors(self, indices, errors):
         self.errors[indices] = errors.reshape(-1, 1)
 
-    # --------------------------------------------------
-    # fairness sampling
-    # --------------------------------------------------
-
+    #simple uniform sampling, for ablation
     def sample(self, batch_size: int):
         assert self.size > 0, "Cannot sample from empty buffer"
 
-        chosen = []
-
-        while len(chosen) < batch_size:
-            # current fairness layer
-            idx_pool = np.nonzero(
-                self.use_count[:self.size] == self.min_use
-            )[0]
-
-            # if empty → advance layer
-            if len(idx_pool) == 0:
-                self.min_use += 1
-                continue
-
-            remaining = batch_size - len(chosen)
-
-            # take without replacement
-            if len(idx_pool) <= remaining:
-                take = idx_pool
-            else:
-                take = np.random.choice(idx_pool, remaining, replace=False)
-
-            chosen.extend(take.tolist())
-
-            # update usage counts
-            self.use_count[take] += 1
-
-            # if layer exhausted → bump min
-            if np.all(self.use_count[:self.size] > self.min_use):
-                self.min_use += 1
-
-        choice = np.array(chosen, dtype=np.int64)
+        choice = np.random.choice(self.size, batch_size, replace=False)
 
         batch = dict(
             obs=torch.as_tensor(self.obs[choice], device=self.device),
@@ -111,14 +78,43 @@ class ReplayBuffer:
 
         return batch
 
-    def reset_usage(self):
-        self.use_count[:self.size] = 0
-        self.min_use = 0
+    # --------------------------------------------------
+    # fairness sampling
+    # --------------------------------------------------
+
+    def sample_fair(self, batch_size: int):
+        assert self.size >= batch_size, "Not enough samples in buffer"
+
+        # fairness priority:
+        # first key = use_count (lower is better)
+        # second key = random tie breaker
+        noise = np.random.rand(self.size)
+        priority = self.use_count[:self.size] + 1e-6 * noise
+
+        # pick smallest priorities
+        choice = np.argsort(priority)[:batch_size]
+
+        # update usage
+        self.use_count[choice] += 1
+
+        batch = dict(
+            obs=torch.as_tensor(self.obs[choice], device=self.device),
+            actions=torch.as_tensor(self.actions[choice], device=self.device),
+            rewards=torch.as_tensor(self.rewards[choice], device=self.device),
+            next_obs=torch.as_tensor(self.next_obs[choice], device=self.device),
+            dones=torch.as_tensor(self.dones[choice], device=self.device),
+        )
+
+        return batch
+
+
+
 
 
     def sample_prioritized(
             self, batch_size: int, ratio=10.0, eps=1e-8
         ):
+        raise NotImplementedError("Prioritized sampling is broken, do not use --- IGNORE ---")
         assert self.size > 0
 
         N = self.size

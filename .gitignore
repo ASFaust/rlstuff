@@ -10,3 +10,7 @@ env/
 venv/
 #ignore pycharm files
 .idea/
+#hydra ignore
+outputs/
+#wandb ignore
+wandb/

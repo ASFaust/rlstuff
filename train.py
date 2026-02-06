@@ -81,7 +81,7 @@ def main(cfg: DictConfig):
         subtract_min=cfg.agent.subtract_min,
         alpha_init=cfg.agent.alpha_init,
         learn_alpha=cfg.agent.learn_alpha,
-        detach_rhs=cfg.agent.detach_rhs,
+        rhs_grad_scale=cfg.agent.rhs_grad_scale,
         optimizer=cfg.agent.optimizer,
         positivity_transform=cfg.agent.positivity_transform,
         use_per=cfg.agent.use_per,
@@ -137,3 +137,9 @@ def main(cfg: DictConfig):
 
 if __name__ == "__main__":
     main()
+
+
+#example usage:
+# python train.py agent=discrete env=breakout training.total_steps=1000000
+# with overrides for any of the config parameters, e.g. to use a different optimizer:
+# python train.py agent=discrete env=breakout training.total_steps=1000000 agent.optimizer=sgd

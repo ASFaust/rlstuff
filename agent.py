@@ -55,7 +55,7 @@ class DiscreteAgent:
         subtract_min=False,
         learn_alpha=False,
         alpha_init=1.0,
-        detach_rhs=False,
+        rhs_grad_scale=0.0,
         optimizer="adam",
         positivity_transform="softplus",
         use_per=False,
@@ -65,7 +65,7 @@ class DiscreteAgent:
         self.use_per = use_per
         self.per_clamp = per_clamp
         self.gamma = gamma
-        self.detach_rhs = detach_rhs
+        self.rhs_grad_scale = rhs_grad_scale
         self.subtract_min = subtract_min
         self.batch_size = batch_size
         self.buffer = buffer
@@ -75,20 +75,19 @@ class DiscreteAgent:
         self.sqrt_alpha = torch.tensor(np.sqrt(alpha_init), requires_grad=True, device=device)
         if learn_alpha:
             self.alpha_optimizer = get_optimizer(optimizer, [self.sqrt_alpha], lr=lr_alpha)
-
         self.learn_alpha = learn_alpha
         self.value_net = nn.Sequential(
             nn.Linear(obs_dim, 256),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(256, 256),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(256, 1 ),
         ).to(device) 
         self.regret_net = nn.Sequential(
             nn.Linear(obs_dim, 256),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(256, 256),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(256, n_actions),
         ).to(device)
         self.positivity_transform = get_positivity_transform(positivity_transform)
@@ -97,18 +96,16 @@ class DiscreteAgent:
 
     @property
     def alpha(self):
-        return self.sqrt_alpha ** 2.0 
+        with torch.no_grad():
+            return self.sqrt_alpha ** 2
 
     def act(self, obs, epsilon=0.1, greedy=False):
         #entropy regularized action selection
         obs = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
-            regrets = self.positivity_transform(self.regret_net(obs))
-            value = self.value_net(obs)
-            if self.subtract_min:
-                regrets = regrets - regrets.min(dim=1, keepdim=True)[0] #optional: subtract min regret to improve stability
+            value, regrets = self._values_and_regrets(obs)
             if greedy:
-                action = torch.argmin(regrets).item()
+                action = regrets.argmin(dim=1).item()
             else:
                 action_probs = F.softmax((value - regrets) / self.alpha, dim=1)
                 action = torch.multinomial(action_probs, num_samples=1).item()
@@ -116,6 +113,14 @@ class DiscreteAgent:
 
     def store(self, obs, action, reward, next_obs, done):
         self.buffer.add(obs, action, reward, next_obs, done)
+
+    def _values_and_regrets(self, obs):
+        values = self.value_net(obs).squeeze()
+        regrets = self.regret_net(obs)
+        regrets = self.positivity_transform(regrets)
+        if self.subtract_min:
+            regrets = regrets - regrets.min(dim=1, keepdim=True)[0] #optional: subtract min regret to improve stability
+        return values, regrets
 
     def update(self):
         if len(self.buffer) < self.batch_size:
@@ -136,26 +141,43 @@ class DiscreteAgent:
 
         #compute targets
         #with torch.no_grad():
-        with torch.no_grad() if self.detach_rhs else nullcontext():
-            #compute V(next_obs) using value net
+        if self.rhs_grad_scale == 0.0:
+            with torch.no_grad():
+                #compute V(next_obs) using value net
+                next_values = self.value_net(next_obs).squeeze() #shape [batch_size]
+                #target = r + gamma * (1-done) * V(next_obs)
+                #rewards has shape [batch_size], dones has shape [batch_size], next_values has shape [batch_size]
+                targets = rewards + self.gamma * (1.0 - dones) * next_values
+                #so targets has shape [batch_size]
+        else:
             next_values = self.value_net(next_obs).squeeze()
-            #target = r + gamma * (1-done) * V(next_obs)
             targets = rewards + self.gamma * (1.0 - dones) * next_values
+            targets = self.rhs_grad_scale * targets + (1.0 - self.rhs_grad_scale) * targets.detach()
 
         #compute current estimates
-        values = self.value_net(obs).squeeze()
-        regrets = self.positivity_transform(self.regret_net(obs))
-        if self.subtract_min:
-            regrets = regrets - regrets.min(dim=1, keepdim=True)[0] #optional: subtract min regret to improve stability
+        values, regrets = self._values_and_regrets(obs) #values has shape [batch_size], regrets has shape [batch_size, n_actions]
         #select the regrets for the taken actions
         action_regrets = regrets.gather(1, actions.unsqueeze(1)).squeeze()
         #compute Q values for taken actions
         q_values = values - action_regrets
+        
+        td_errors = q_values - targets
+
         #compute loss (includes regret net since Q depends on it)
-        squared_errors = (q_values - targets) ** 2
+        squared_errors = td_errors ** 2
         if self.use_per:
             self.buffer.update_errors(batch["indices"], squared_errors.detach().cpu().numpy())
-        loss = squared_errors.mean()
+        
+        loss = squared_errors.mean() #log loss to stabilize training, since regret can be unbounded and we want to heavily penalize large errors
+
+        #extra loss term: 
+        #which we need to anchor to a stable 
+
+        #done_mask = dones.bool()
+        #if done_mask.any(): 
+        #    done_next_values = next_values[done_mask]
+        #    done_loss = (done_next_values ** 2).mean()
+        #    loss = loss + done_loss
 
         self.value_optimizer.zero_grad()
         self.regret_optimizer.zero_grad()
@@ -183,12 +205,10 @@ class DiscreteAgent:
         if self.learn_alpha:
             #update alpha   
             with torch.no_grad():
-                log_action_probs = F.log_softmax((values.unsqueeze(1)-regrets) / self.alpha, dim=1)
-                entropy = -(action_probs * log_action_probs).sum(dim=1)
+                log_action_probs = torch.log(action_probs + 1e-8)
+                entropy = -(action_probs * log_action_probs).sum(dim=1).mean()
 
-            alpha_loss = (action_probs * (
-                - self.alpha * (log_action_probs + self.target_entropy)
-                )).sum(dim=-1).mean()
+            alpha_loss = (self.sqrt_alpha) ** 2 * (entropy - self.target_entropy)
 
             self.alpha_optimizer.zero_grad()
             alpha_loss.backward()

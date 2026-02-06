@@ -4,19 +4,19 @@ n_actions: null
 buffer_size: 100000
 batch_size: 256
 gamma: 0.99
-target_entropy: 0.4
+target_entropy: 0.2
 
-lr_value: 0.0001
-lr_regret: 0.0001
-lr_alpha: 0.0001
+lr_value: 0.001
+lr_regret: 0.001
+lr_alpha: 0.001 #alpha is just used for sampling, not for learning, so we can use a higher learning rate
 optimizer: adam
 
-subtract_min: false 
-alpha_init: 0.01
+subtract_min: true 
+alpha_init: 0.1
 learn_alpha: true
-detach_rhs: true #whether to detach the right hand side of the bellman equation when computing the loss
-
-positivity_transform: softplus #transform to ensure regret estimates are positive, can be "softplus", "exp", "relu", "square", or "abs"
+rhs_grad_scale: 0.5 #0.0 = standard bellman, 1.0 = 2-sided bellman. 0.0 can overestimate value, 1.0 can prevent policy improvement. 
+#a bit of rhs_grad_scale can prevent overestimation while still allowing policy improvement.
+positivity_transform: exp #transform to ensure regret estimates are positive, can be "softplus", "exp", "relu", "square", or "abs"
 
 use_per: false # whether to use prioritized experience replay
 per_clamp: 2.0 # wasserstein transport clamp -> sample up to 10x more from high regret transitions than uniform sampling

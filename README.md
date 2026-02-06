@@ -50,3 +50,11 @@ The implementation uses two networks:
 Action selection is:
 - greedy `argmin_a g(s,a)` for evaluation,
 - or a softmax over `f(s) - g(s,a)` for exploration, with optional learned temperature.
+
+
+# TODOs
+* implement optional target network
+* debug PER (pass use_per also to replay buffer constructor, cant use both samplers on one instance anyways)
+* add importance weights and beta to PER sample return and in the agent-computation
+* add config param for architecture choice: 2 networks or 2 heads on one network?
+* config param to push regret down for best found action? i mean training the regret function to output 0 for best found action
