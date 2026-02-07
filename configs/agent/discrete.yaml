@@ -1,7 +1,7 @@
 obs_dim: null  # inferred at runtime
 n_actions: null
 
-buffer_size: 100000
+buffer_size: 2000
 batch_size: 256
 gamma: 0.99
 target_entropy: 0.2
@@ -11,7 +11,7 @@ lr_regret: 0.001
 lr_alpha: 0.001 #alpha is just used for sampling, not for learning, so we can use a higher learning rate
 optimizer: adam
 
-subtract_min: true 
+subtract_min: false 
 alpha_init: 0.1
 learn_alpha: true
 rhs_grad_scale: 0.0 #0.0 = standard bellman, 1.0 = 2-sided bellman. 0.0 can overestimate value, 1.0 can prevent policy improvement. 
