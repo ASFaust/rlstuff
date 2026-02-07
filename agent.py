@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 from ReplayBuffer import ReplayBuffer
 from contextlib import nullcontext
+from network import DiscreteNetwork 
 
 #this implements:
 #V(s) = max_a Q(s,a)
@@ -36,6 +37,8 @@ def get_positivity_transform(name):
         return torch.square
     elif name == "abs":
         return torch.abs
+    elif name == "identity":
+        return lambda x: x
     else:
         raise ValueError(f"Unsupported positivity transform: {name}")
 
@@ -46,26 +49,26 @@ class DiscreteAgent:
         n_actions,
         buffer,
         target_entropy,
-        lr_value=1e-3,
-        lr_regret=1e-3,
-        lr_alpha=1e-3,
-        gamma=0.99,
-        batch_size=256,
-        device="cpu",
-        subtract_min=False,
-        learn_alpha=False,
-        alpha_init=1.0,
-        rhs_grad_scale=0.0,
-        optimizer="adam",
-        positivity_transform="softplus",
-        use_per=False,
-        per_clamp=10.0,
+        loss_weights,
+        terminal_value,
+        lr,
+        lr_alpha,
+        gamma,
+        batch_size,
+        subtract_min,
+        learn_alpha,
+        alpha_init,
+        optimizer,
+        positivity_transform,
+        hidden_dim,
+        on_off_policy_lambda,
+        device="cpu"
     ):
         self.device = device
-        self.use_per = use_per
-        self.per_clamp = per_clamp
+        self.loss_weights = loss_weights
+        self.terminal_value = terminal_value
+        self.on_off_policy_lambda = on_off_policy_lambda
         self.gamma = gamma
-        self.rhs_grad_scale = rhs_grad_scale
         self.subtract_min = subtract_min
         self.batch_size = batch_size
         self.buffer = buffer
@@ -76,23 +79,9 @@ class DiscreteAgent:
         if learn_alpha:
             self.alpha_optimizer = get_optimizer(optimizer, [self.sqrt_alpha], lr=lr_alpha)
         self.learn_alpha = learn_alpha
-        self.value_net = nn.Sequential(
-            nn.Linear(obs_dim, 256),
-            nn.SiLU(),
-            nn.Linear(256, 256),
-            nn.SiLU(),
-            nn.Linear(256, 1 ),
-        ).to(device) 
-        self.regret_net = nn.Sequential(
-            nn.Linear(obs_dim, 256),
-            nn.SiLU(),
-            nn.Linear(256, 256),
-            nn.SiLU(),
-            nn.Linear(256, n_actions),
-        ).to(device)
+        self.net = DiscreteNetwork(obs_dim, n_actions, hidden_dim).to(device)
         self.positivity_transform = get_positivity_transform(positivity_transform)
-        self.value_optimizer = get_optimizer(optimizer, self.value_net.parameters(), lr=lr_value)
-        self.regret_optimizer = get_optimizer(optimizer, self.regret_net.parameters(), lr=lr_regret)
+        self.net_optimizer = get_optimizer(optimizer, self.net.parameters(), lr=lr)
 
     @property
     def alpha(self):
@@ -115,21 +104,17 @@ class DiscreteAgent:
         self.buffer.add(obs, action, reward, next_obs, done)
 
     def _values_and_regrets(self, obs):
-        values = self.value_net(obs).squeeze()
-        regrets = self.regret_net(obs)
-        regrets = self.positivity_transform(regrets)
+        values, regrets = self.net(obs) #values has shape [batch_size], regrets has shape [batch_size, n_actions]
         if self.subtract_min:
             regrets = regrets - regrets.min(dim=1, keepdim=True)[0] #optional: subtract min regret to improve stability
+        regrets = self.positivity_transform(regrets) #ensure regrets are positive
         return values, regrets
 
     def update(self):
         if len(self.buffer) < self.batch_size:
             return {}
 
-        if self.use_per:
-            batch = self.buffer.sample_prioritized(self.batch_size, ratio=self.per_clamp)
-        else:
-            batch = self.buffer.sample(self.batch_size)
+        batch = self.buffer.sample(self.batch_size)
 
         obs = batch["obs"]
         actions = batch["actions"].long().view(-1)
@@ -138,58 +123,67 @@ class DiscreteAgent:
         dones = batch["dones"].view(-1)
 
         self.steps += 1
+        next_values, _ = self.net(next_obs)
 
-        #compute targets
-        #with torch.no_grad():
-        if self.rhs_grad_scale == 0.0:
-            with torch.no_grad():
-                #compute V(next_obs) using value net
-                next_values = self.value_net(next_obs).squeeze() #shape [batch_size]
-                #target = r + gamma * (1-done) * V(next_obs)
-                #rewards has shape [batch_size], dones has shape [batch_size], next_values has shape [batch_size]
-                targets = rewards + self.gamma * (1.0 - dones) * next_values
-                #so targets has shape [batch_size]
+        values, regrets = self._values_and_regrets(obs)
+        taken_regret = regrets.gather(1, actions.unsqueeze(1)).squeeze()
+
+        mask = (1.0 - dones)
+
+        # raw Bellman residual
+        # this is the regret target.
+        bellman_residual = values - (rewards + self.gamma * mask * next_values)
+
+        # -------------------------
+        # backward Bellman (standard TD)
+        # -------------------------
+        with torch.no_grad():
+            bw_target_on_policy = rewards + self.gamma * mask * next_values
+            bw_target_off_policy = bw_target_on_policy + taken_regret.detach()
+            bw_target = self.on_off_policy_lambda * bw_target_on_policy + \
+                        (1.0 - self.on_off_policy_lambda) * bw_target_off_policy
+
+        bw_loss = (values - bw_target).pow(2).mean()
+
+        # -------------------------
+        # regret hinge
+        # -------------------------
+        regret_target = torch.clamp(bellman_residual, min=0).detach()
+        regret_loss = (taken_regret - regret_target).pow(2).mean()
+
+        # -------------------------
+        # forward consistency hinge
+        # only active when Bellman violated (bellman_residual < 0)
+        # -------------------------
+        fw_loss = torch.clamp(bellman_residual, max=0).pow(2).mean()
+
+        # and a loss for the terminals to be close to zero
+        if dones.any():
+            # optional: encourage terminal states to have zero value by penalizing the value of terminal states
+            terminal_loss = (values[dones.bool()] - self.terminal_value).pow(2).mean()
         else:
-            next_values = self.value_net(next_obs).squeeze()
-            targets = rewards + self.gamma * (1.0 - dones) * next_values
-            targets = self.rhs_grad_scale * targets + (1.0 - self.rhs_grad_scale) * targets.detach()
+            terminal_loss = torch.tensor(0.0, device=self.device)
 
-        #compute current estimates
-        values, regrets = self._values_and_regrets(obs) #values has shape [batch_size], regrets has shape [batch_size, n_actions]
-        #select the regrets for the taken actions
-        action_regrets = regrets.gather(1, actions.unsqueeze(1)).squeeze()
-        #compute Q values for taken actions
-        q_values = values - action_regrets
-        
-        td_errors = q_values - targets
+        # -------------------------
+        loss = (
+            self.loss_weights.bw * bw_loss +
+            self.loss_weights.regret * regret_loss +
+            self.loss_weights.fw * fw_loss +
+            self.loss_weights.terminal * terminal_loss
+        )
 
-        #compute loss (includes regret net since Q depends on it)
-        squared_errors = td_errors ** 2
-        if self.use_per:
-            self.buffer.update_errors(batch["indices"], squared_errors.detach().cpu().numpy())
-        
-        loss = squared_errors.mean() #log loss to stabilize training, since regret can be unbounded and we want to heavily penalize large errors
-
-        #extra loss term: 
-        #which we need to anchor to a stable 
-
-        #done_mask = dones.bool()
-        #if done_mask.any(): 
-        #    done_next_values = next_values[done_mask]
-        #    done_loss = (done_next_values ** 2).mean()
-        #    loss = loss + done_loss
-
-        self.value_optimizer.zero_grad()
-        self.regret_optimizer.zero_grad()
+        self.net_optimizer.zero_grad()
         loss.backward()
-        self.value_optimizer.step()
-        self.regret_optimizer.step()
+        self.net_optimizer.step()
 
         with torch.no_grad():#values has shape [batch_size], regrets has shape [batch_size, n_actions]
             action_probs = F.softmax((values.unsqueeze(1) - regrets) / self.alpha, dim=1)
 
         ret_dict = {
-            "loss": loss.item(),
+            "loss/bw": bw_loss.item(),
+            "loss/regret": regret_loss.item(),
+            "loss/fw": fw_loss.item(),
+            "loss/terminal": terminal_loss.item(),
             "value/max": values.max().item(),
             "value/min": values.min().item(),
             "value/mean": values.mean().item(),

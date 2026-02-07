@@ -75,17 +75,17 @@ def main(cfg: DictConfig):
         gamma=cfg.agent.gamma,
         batch_size=cfg.agent.batch_size,
         device=device,
-        lr_value=cfg.agent.lr_value,
-        lr_regret=cfg.agent.lr_regret,
+        lr=cfg.agent.lr,
         lr_alpha=cfg.agent.lr_alpha,
         subtract_min=cfg.agent.subtract_min,
         alpha_init=cfg.agent.alpha_init,
         learn_alpha=cfg.agent.learn_alpha,
-        rhs_grad_scale=cfg.agent.rhs_grad_scale,
         optimizer=cfg.agent.optimizer,
         positivity_transform=cfg.agent.positivity_transform,
-        use_per=cfg.agent.use_per,
-        per_clamp=cfg.agent.per_clamp,
+        loss_weights=cfg.agent.loss_weights,
+        terminal_value=cfg.agent.terminal_value,
+        hidden_dim=cfg.agent.hidden_dim,
+        on_off_policy_lambda=cfg.agent.on_off_policy_lambda,
     )
 
     wandb.init(project=cfg.project, config=OmegaConf.to_container(cfg, resolve=True))
