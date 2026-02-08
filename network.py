@@ -1,25 +1,51 @@
 import torch 
 
 class DiscreteNetwork(torch.nn.Module):
-    def __init__(self, obs_dim, n_actions, hidden_dim=256):
+    def __init__(self, n_channels, n_actions):
         super(DiscreteNetwork, self).__init__()
-        print(f"Initializing DiscreteNetwork with obs_dim={obs_dim}, n_actions={n_actions}, hidden_dim={hidden_dim}")
-        self.fc1 = torch.nn.Linear(obs_dim, hidden_dim)
-        self.g1 = torch.nn.Linear(obs_dim, hidden_dim)
-        self.fc2 = torch.nn.Linear(hidden_dim, hidden_dim)
-        self.g2 = torch.nn.Linear(hidden_dim, hidden_dim)
-        self.l_out = torch.nn.Linear(hidden_dim, 1 + n_actions)  # output: [value, regret for each action]
-        self.n_actions = n_actions
-        self.sigmoid = torch.nn.Sigmoid()
+        #output dim is 1 + n_actions, since we have a value and a regret for each action
+        conv_dim = n_channels * 2
+        n_position_channels = 2
+        #position grid is a learnable parameter for each pixel. it starts at 0 and can learn to encode positional information. we add it as additional channels to the input.
+        #self.position_grid = torch.nn.Parameter(torch.zeros(1,n_position_channels, 10, 10))
+        self.conv1 = torch.nn.Conv2d(n_channels + n_position_channels, conv_dim, kernel_size=3, padding=1)
+        self.conv2 = torch.nn.Conv2d(conv_dim, conv_dim, kernel_size=3, padding=1)
+        self.conv3 = torch.nn.Conv2d(conv_dim, conv_dim, kernel_size=3, padding=1)
+        self.act = torch.nn.SiLU()
+        hidden_dim = max(conv_dim, n_actions) * 4 
+        self.fc = torch.nn.Linear(conv_dim * 2, hidden_dim)
+        self.l_out = torch.nn.Linear(hidden_dim, 1 + n_actions)
+        #print summary of network: number of conv channels, n_position_channels, hidden dim, number of parameters
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"DiscreteNetwork initialized with {total_params} parameters, conv_dim={conv_dim}, n_position_channels={n_position_channels}, hidden_dim={hidden_dim}, obs_dim={n_channels}, n_actions={n_actions}")
 
-    def forward(self, x):
-        h1 = self.fc1(x)
-        g1 = self.sigmoid(self.g1(x))
-        h1 = h1 * g1
-        h2 = self.fc2(h1)
-        g2 = self.sigmoid(self.g2(h1))
-        h2 = h2 * g2  
-        out = self.l_out(h2)
-        value = out[:, 0]  # state value
-        regret = out[:, 1:]  # regret for each action
-        return value, regret
+        #add a fixed position grid that goes from 0 to 1 in x and y direction, to help the learnable position grid
+        x = torch.linspace(-1, 1, steps=10)
+        y = torch.linspace(-1, 1, steps=10)
+        xx, yy = torch.meshgrid(x, y, indexing='ij')
+        fixed_position_grid = torch.stack([xx, yy], dim=0).unsqueeze(0) # (1, 2, 10, 10)
+        self.register_buffer("fixed_position_grid", fixed_position_grid)
+
+    def forward(self, obs):
+        #obs is (batch, n_channels, 10, 10)
+        batch_size = obs.shape[0]
+        #position_grid = self.position_grid.expand(batch_size, -1, -1, -1) # (batch, n_position_channels, 10, 10)
+        x = torch.cat([obs, self.fixed_position_grid.expand(batch_size, -1, -1, -1)], dim=1) # (batch, n_channels + n_position_channels, 10, 10)
+        x = self.act(self.conv1(x))
+        x = self.act(self.conv2(x))
+        x = self.act(self.conv3(x))
+        x_mean = x.mean(dim=[2,3]) # global average pooling, (batch, conv_dim)
+        x_max = x.amax(dim=[2,3]) # global max pooling, (batch, conv_dim)
+        x = torch.cat([x_mean, x_max], dim=1) # (batch, conv_dim * 2)
+        x = self.act(self.fc(x))
+        out = self.l_out(x) # (batch, 1 + n_actions)
+        values = out[:, 0] # (batch,)
+        regrets = out[:, 1:] # (batch, n_actions)
+        return values, regrets
+
+
+    def get_position_grid(self):
+        #get the position grid as a numpy array, for visualization
+        #add the fixed position grid to the learnable position grid, and return as numpy array
+        position_grid = self.fixed_position_grid
+        return position_grid.detach().cpu().numpy()[0] # (n_position_channels, 10, 10)

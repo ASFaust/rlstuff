@@ -8,6 +8,7 @@ from minatar import Environment
 from agent import DiscreteAgent
 from ReplayBuffer import ReplayBuffer
 
+torch.set_float32_matmul_precision('high')
 
 def make_env(game, seed=None):
     env = Environment(game)
@@ -17,7 +18,12 @@ def make_env(game, seed=None):
 
 
 def flatten_obs(obs):
-    return obs.astype(np.float32).reshape(-1)
+    #print(f"Original obs shape: {obs.shape}, dtype: {obs.dtype}") #(10,10,n_channels), bool
+    #we dont want to flatten, we want to rearrange to (n_channels, 10, 10) and convert to float32
+    obs = np.transpose(obs, (2, 0, 1)) # (n_channels, 10, 10)
+    obs = obs.astype(np.float32)
+    return obs
+    #return obs #.astype(np.float32).reshape(-1)
 
 
 def greedy_eval(agent, game, seeds, max_steps=2000):
@@ -42,13 +48,34 @@ def greedy_eval(agent, game, seeds, max_steps=2000):
 
     returns = np.array(returns)
 
-    return {
+    ret = {
         "eval/mean": returns.mean(),
         "eval/std": returns.std(),
         "eval/min": returns.min(),
         "eval/max": returns.max(),
     }
 
+    pos_grid = agent.net.get_position_grid()
+
+    for i in range(pos_grid.shape[0]):
+        img = pos_grid[i]
+
+        # normalize to [0,1] for consistent coloring
+        img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+
+        ret[f"eval/position_grid/channel_{i}"] = wandb.Image(
+            img,
+            caption=f"Position Grid Channel {i}",
+        )
+
+    #add statistics about the position grid values. mean min max std for each channel
+    for i in range(pos_grid.shape[0]):
+        channel = pos_grid[i]
+        ret[f"position_grid/channel_{i}_mean"] = channel.mean()
+        ret[f"position_grid/channel_{i}_std"] = channel.std()
+        ret[f"position_grid/channel_{i}_spread"] = channel.max() - channel.min()
+
+    return ret
 
 @hydra.main(config_path="configs", config_name="config", version_base=None)
 def main(cfg: DictConfig):
@@ -65,7 +92,7 @@ def main(cfg: DictConfig):
     obs_dim = obs.shape[0]
     n_actions = env.num_actions()
 
-    buffer = ReplayBuffer(cfg.agent.buffer_size, obs_dim, device=device)
+    buffer = ReplayBuffer(capacity = cfg.agent.buffer_size, obs_shape=obs.shape, device=device)
 
     agent = DiscreteAgent(
         obs_dim=obs_dim,
@@ -84,8 +111,8 @@ def main(cfg: DictConfig):
         positivity_transform=cfg.agent.positivity_transform,
         loss_weights=cfg.agent.loss_weights,
         terminal_value=cfg.agent.terminal_value,
-        hidden_dim=cfg.agent.hidden_dim,
         on_off_policy_lambda=cfg.agent.on_off_policy_lambda,
+        tau=cfg.agent.tau,
     )
 
     wandb.init(project=cfg.project, config=OmegaConf.to_container(cfg, resolve=True))

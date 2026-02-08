@@ -60,8 +60,8 @@ class DiscreteAgent:
         alpha_init,
         optimizer,
         positivity_transform,
-        hidden_dim,
         on_off_policy_lambda,
+        tau,
         device="cpu"
     ):
         self.device = device
@@ -79,9 +79,14 @@ class DiscreteAgent:
         if learn_alpha:
             self.alpha_optimizer = get_optimizer(optimizer, [self.sqrt_alpha], lr=lr_alpha)
         self.learn_alpha = learn_alpha
-        self.net = DiscreteNetwork(obs_dim, n_actions, hidden_dim).to(device)
+        self.net = DiscreteNetwork(obs_dim, n_actions).to(device)
         self.positivity_transform = get_positivity_transform(positivity_transform)
         self.net_optimizer = get_optimizer(optimizer, self.net.parameters(), lr=lr)
+        self.tau = tau
+        if tau != 1.0:
+            self.target_net = DiscreteNetwork(obs_dim, n_actions).to(device)
+            self.target_net.load_state_dict(self.net.state_dict())
+
 
     @property
     def alpha(self):
@@ -105,9 +110,9 @@ class DiscreteAgent:
 
     def _values_and_regrets(self, obs):
         values, regrets = self.net(obs) #values has shape [batch_size], regrets has shape [batch_size, n_actions]
+        regrets = self.positivity_transform(regrets) #ensure regrets are positive
         if self.subtract_min:
             regrets = regrets - regrets.min(dim=1, keepdim=True)[0] #optional: subtract min regret to improve stability
-        regrets = self.positivity_transform(regrets) #ensure regrets are positive
         return values, regrets
 
     def update(self):
@@ -123,7 +128,13 @@ class DiscreteAgent:
         dones = batch["dones"].view(-1)
 
         self.steps += 1
-        next_values, _ = self.net(next_obs)
+
+        #no grad for next_values
+        with torch.no_grad():
+            if self.tau != 1.0:
+                next_values, _ = self.target_net(next_obs)
+            else:
+                next_values, _ = self.net(next_obs)
 
         values, regrets = self._values_and_regrets(obs)
         taken_regret = regrets.gather(1, actions.unsqueeze(1)).squeeze()
@@ -138,12 +149,21 @@ class DiscreteAgent:
         # backward Bellman (standard TD)
         # -------------------------
         with torch.no_grad():
-            bw_target_on_policy = rewards + self.gamma * mask * next_values
-            bw_target_off_policy = bw_target_on_policy + taken_regret.detach()
-            bw_target = self.on_off_policy_lambda * bw_target_on_policy + \
-                        (1.0 - self.on_off_policy_lambda) * bw_target_off_policy
+            bw_target = rewards + self.gamma * mask * next_values + taken_regret.detach() * (1.0 - self.on_off_policy_lambda)
 
         bw_loss = (values - bw_target).pow(2).mean()
+
+        # experimental forward bellman loss, only valid in expectation, since we can't assume deterministic transitions, so we use the mean value over the batch.
+        fw_target = rewards + self.gamma * mask * next_values + taken_regret * (1.0 - self.on_off_policy_lambda)
+        fw_loss = (values.mean() - fw_target.mean()).pow(2)
+
+        # gauge fixing:
+        with torch.no_grad():
+            anchor_actions = (values.unsqueeze(1) - regrets).argmax(dim=1)   # same as regrets.argmin if V is scalar
+
+        anchor_regret = regrets.gather(1, anchor_actions.unsqueeze(1)).squeeze()
+        gauge_loss = anchor_regret.pow(2).mean()   # or .mean()
+
 
         # -------------------------
         # regret hinge
@@ -154,8 +174,10 @@ class DiscreteAgent:
         # -------------------------
         # forward consistency hinge
         # only active when Bellman violated (bellman_residual < 0)
+        # can only act on the mean, not per sample, 
+        # since we can't assume deterministic transitions
         # -------------------------
-        fw_loss = torch.clamp(bellman_residual, max=0).pow(2).mean()
+        cons_loss = torch.clamp(bellman_residual.mean(), max=0).pow(2)
 
         # and a loss for the terminals to be close to zero
         if dones.any():
@@ -168,13 +190,21 @@ class DiscreteAgent:
         loss = (
             self.loss_weights.bw * bw_loss +
             self.loss_weights.regret * regret_loss +
-            self.loss_weights.fw * fw_loss +
-            self.loss_weights.terminal * terminal_loss
+            self.loss_weights.consistency * cons_loss +
+            self.loss_weights.terminal * terminal_loss +
+            self.loss_weights.fw * fw_loss + 
+            self.loss_weights.gauge * gauge_loss
         )
 
         self.net_optimizer.zero_grad()
         loss.backward()
         self.net_optimizer.step()
+
+        #update target network with soft updates
+        if self.tau != 1.0:
+            with torch.no_grad():
+                for param, target_param in zip(self.net.parameters(), self.target_net.parameters()):
+                    target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
 
         with torch.no_grad():#values has shape [batch_size], regrets has shape [batch_size, n_actions]
             action_probs = F.softmax((values.unsqueeze(1) - regrets) / self.alpha, dim=1)
@@ -182,8 +212,10 @@ class DiscreteAgent:
         ret_dict = {
             "loss/bw": bw_loss.item(),
             "loss/regret": regret_loss.item(),
-            "loss/fw": fw_loss.item(),
+            "loss/consistency": cons_loss.item(),
             "loss/terminal": terminal_loss.item(),
+            "loss/fw": fw_loss.item(),
+            "loss/gauge": gauge_loss.item(),
             "value/max": values.max().item(),
             "value/min": values.min().item(),
             "value/mean": values.mean().item(),
