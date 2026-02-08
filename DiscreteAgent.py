@@ -151,19 +151,18 @@ class DiscreteAgent:
         with torch.no_grad():
             bw_target = rewards + self.gamma * mask * next_values + taken_regret.detach() * (1.0 - self.on_off_policy_lambda)
 
-        bw_loss = (values - bw_target).pow(2).mean()
-
+        bw_loss = (values - bw_target).pow(2).mean() 
+        
         # experimental forward bellman loss, only valid in expectation, since we can't assume deterministic transitions, so we use the mean value over the batch.
         fw_target = rewards + self.gamma * mask * next_values + taken_regret * (1.0 - self.on_off_policy_lambda)
         fw_loss = (values.mean() - fw_target.mean()).pow(2)
 
         # gauge fixing:
         with torch.no_grad():
-            anchor_actions = (values.unsqueeze(1) - regrets).argmax(dim=1)   # same as regrets.argmin if V is scalar
+            anchor_actions = regrets.argmin(dim=1) #anchor action is the action with lowest regret, should be the optimal action, we want its regret to be zero, this fixes the gauge freedom of the regret. we can also use a random action as anchor, but this is more stable and makes more sense.
 
         anchor_regret = regrets.gather(1, anchor_actions.unsqueeze(1)).squeeze()
         gauge_loss = anchor_regret.pow(2).mean()   # or .mean()
-
 
         # -------------------------
         # regret hinge
@@ -227,7 +226,6 @@ class DiscreteAgent:
             "action prob/min": action_probs.min(dim=1)[0].mean().item(),
             "action prob/taken": action_probs.gather(1, actions.unsqueeze(1)).mean().item(),
         }
-
         if self.learn_alpha:
             #update alpha   
             with torch.no_grad():

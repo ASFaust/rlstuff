@@ -5,7 +5,7 @@ import torch
 import wandb
 
 from minatar import Environment
-from agent import DiscreteAgent
+from DiscreteAgent import DiscreteAgent
 from ReplayBuffer import ReplayBuffer
 
 torch.set_float32_matmul_precision('high')

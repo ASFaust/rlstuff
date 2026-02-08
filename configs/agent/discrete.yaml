@@ -4,12 +4,11 @@ n_actions: null
 buffer_size: 100000
 batch_size: 256
 gamma: 0.99
-target_entropy: 0.7
+target_entropy: 0.6
 
 lr: 0.001
 lr_alpha: 0.001 #alpha is just used for sampling, not for learning, so we can use a higher learning rate. 
 optimizer: adam
-
 
 soft_target: false #soft targets are SAC style updates, hard targets are DQN style updates. 
 subtract_min: false 
@@ -23,7 +22,7 @@ loss_weights:
   fw: 1.0 
   gauge: 1.0 #gauge loss to fix the gauge freedom of the regret, this improves stability greatly.
 
-positivity_transform: exp #softplus, relu, exp, abs, square, identity (identity breaks if subtract_min is false, since then we can have negative values)
+positivity_transform: softplus #softplus, relu, exp, abs, square, identity (identity breaks if subtract_min is false, since then we can have negative values)
 
 terminal_value: 0.0 # a smaller value than 0 rewards longer trajectories, this is an injected reward at terminal states
 
