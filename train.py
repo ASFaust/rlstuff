@@ -7,6 +7,7 @@ import wandb
 from minatar import Environment
 from DiscreteAgent import DiscreteAgent
 from ReplayBuffer import ReplayBuffer
+from eval_video import make_eval_video_frames
 
 torch.set_float32_matmul_precision('high')
 
@@ -54,26 +55,6 @@ def greedy_eval(agent, game, seeds, max_steps=2000):
         "eval/min": returns.min(),
         "eval/max": returns.max(),
     }
-
-    pos_grid = agent.net.get_position_grid()
-
-    for i in range(pos_grid.shape[0]):
-        img = pos_grid[i]
-
-        # normalize to [0,1] for consistent coloring
-        img = (img - img.min()) / (img.max() - img.min() + 1e-8)
-
-        ret[f"eval/position_grid/channel_{i}"] = wandb.Image(
-            img,
-            caption=f"Position Grid Channel {i}",
-        )
-
-    #add statistics about the position grid values. mean min max std for each channel
-    for i in range(pos_grid.shape[0]):
-        channel = pos_grid[i]
-        ret[f"position_grid/channel_{i}_mean"] = channel.mean()
-        ret[f"position_grid/channel_{i}_std"] = channel.std()
-        ret[f"position_grid/channel_{i}_spread"] = channel.max() - channel.min()
 
     return ret
 
@@ -158,6 +139,18 @@ def main(cfg: DictConfig):
             eval_stats = greedy_eval(agent, cfg.env.game, eval_seeds)
             wandb.log(eval_stats, step=global_step)
             print(f"[{global_step}] eval:", eval_stats)
+            video_frames = make_eval_video_frames(
+                agent,
+                cfg.env.game,
+                seed=eval_seeds[0],
+                max_steps=2000,
+                fps=4,
+            )
+            if video_frames.shape[0] > 0:
+                wandb.log(
+                    {"eval/rollout": wandb.Video(video_frames, format="mp4", fps=4)},
+                    step=global_step,
+                )
 
     wandb.finish()
 
