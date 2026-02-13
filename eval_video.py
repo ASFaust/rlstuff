@@ -101,7 +101,7 @@ def _render_value_plot(values, width, height, line_color="black"):
 def _value_for_obs(agent, obs):
     obs_t = torch.tensor(obs, dtype=torch.float32, device=agent.device).unsqueeze(0)
     with torch.no_grad():
-        values, _ = agent._values_and_regrets(obs_t)
+        values, _ = agent.net_value_regret(agent.net_embed(obs_t))
     return float(values.item())
 
 

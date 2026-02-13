@@ -5,9 +5,10 @@ defaults:
 
 seed: 0
 device: cuda
-project: minatar-regret
+project: minatar-regret-2
 
 training:
   total_steps: 200000
   eval_interval: 1000
+  random_steps: 0
   updates_per_step: 4

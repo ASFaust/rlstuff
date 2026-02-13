@@ -92,8 +92,6 @@ def main(cfg: DictConfig):
         positivity_transform=cfg.agent.positivity_transform,
         loss_weights=cfg.agent.loss_weights,
         terminal_value=cfg.agent.terminal_value,
-        on_off_policy_lambda=cfg.agent.on_off_policy_lambda,
-        tau=cfg.agent.tau,
     )
 
     wandb.init(project=cfg.project, config=OmegaConf.to_container(cfg, resolve=True))
@@ -103,11 +101,20 @@ def main(cfg: DictConfig):
     episode = 0
     obs = flatten_obs(env.state())
     eval_seeds = list(range(10))
+    sum_rewards = 0
 
     while global_step < cfg.training.total_steps:
 
-        action = agent.act(obs)
+        # random warmup
+        if global_step < cfg.training.random_steps or (sum_rewards == 0):
+            action = np.random.randint(n_actions)
+        else:
+            action = agent.act(obs)
+
         reward, done = env.act(action)
+        if reward != 0 and sum_rewards == 0:
+            print(f"First non-zero reward: {reward} at step {global_step}")
+        sum_rewards += reward
         next_obs = flatten_obs(env.state())
 
         agent.store(obs, action, reward, next_obs, done)
@@ -131,11 +138,12 @@ def main(cfg: DictConfig):
                 step=global_step,
             )
             episode += 1
+            print(f"[{global_step}] episode_return={episode_return}")
             episode_return = 0
             env = make_env(cfg.env.game)
             obs = flatten_obs(env.state())
 
-        if global_step % cfg.training.eval_interval == 0:
+        if global_step % cfg.training.eval_interval == 0 and global_step > cfg.training.random_steps:
             eval_stats = greedy_eval(agent, cfg.env.game, eval_seeds)
             wandb.log(eval_stats, step=global_step)
             print(f"[{global_step}] eval:", eval_stats)

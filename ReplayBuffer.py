@@ -36,12 +36,19 @@ class ReplayBuffer:
         self.ptr = 0
         self.size = 0
 
+        self.min_reward = float("inf")
+        self.max_reward = float("-inf")
+
 
     # --------------------------------------------------
     # insert transition
     # --------------------------------------------------
 
     def add(self, obs, action, reward, next_obs, done):
+        if reward < self.min_reward:
+            self.min_reward = reward
+        if reward > self.max_reward:
+            self.max_reward = reward
         self.obs[self.ptr] = obs
         self.actions[self.ptr] = action
         self.rewards[self.ptr] = reward
@@ -58,6 +65,9 @@ class ReplayBuffer:
         self.min_use = 0
 
         self.errors[self.ptr] = 0.0
+
+    def get_reward_range(self):
+        return self.min_reward, self.max_reward
 
     def update_errors(self, indices, errors):
         self.errors[indices] = errors.reshape(-1, 1)

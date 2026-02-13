@@ -4,34 +4,22 @@ n_actions: null
 buffer_size: 100000
 batch_size: 256
 gamma: 0.99
-target_entropy: 0.7
+target_entropy: 0.9
 
 lr: 0.001
 lr_alpha: 0.001 #alpha is just used for sampling, not for learning, so we can use a higher learning rate. 
 optimizer: adam
 
-soft_target: false #soft targets are SAC style updates, hard targets are DQN style updates. 
 subtract_min: false 
 alpha_init: 0.1
 learn_alpha: true
-loss_weights:
-  bw: 1.0
-  regret: 1.0
-  terminal: 0.0
-  consistency: 0.0
-  fw: 0.0 
-  gauge: 0.0 #gauge loss to fix the gauge freedom of the regret, this improves stability greatly.
 
-positivity_transform: softplus #softplus, relu, exp, abs, square, identity (identity breaks if subtract_min is false, since then we can have negative values)
+loss_weights:
+    value_regret: 1.0
+    regret: 1.0 #let's try to not use this at all, see if it still works. 
+    value_regularization: 0.0001
+
+#observation: using a positivity transform on the output leads to severe overestimation
+positivity_transform: softplus #softplus, relu, exp, abs, square, identity
 
 terminal_value: 0.0 # a smaller value than 0 rewards longer trajectories, this is an injected reward at terminal states
-
-on_off_policy_lambda: 0.4 # lambda for mixing on-policy and off-policy targets, 0 = only off-policy, 1 = only on-policy. 
-
-tau: 1.0 # for soft updates of the target network. if tau = 1.0, hard update
-
-#on-policy targets are more stable but less efficient, off-policy targets are more efficient but can be unstable, 
-#so we can mix them to get the best of both worlds. 
-#This is used for the value function loss, the regret loss is always defined wrt the value function, 
-#so there is an influence on the regret loss as well.
-
